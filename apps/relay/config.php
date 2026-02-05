@@ -4,6 +4,7 @@ $cache_dir = getenv('RELAY_CACHE_DIR') ?: __DIR__ . '/storage/cache';
 $log_file = getenv('RELAY_LOG_FILE') ?: __DIR__ . '/storage/relay.log';
 $access_log_file = getenv('RELAY_ACCESS_LOG_FILE') ?: __DIR__ . '/storage/access.log';
 $rate_limit_dir = getenv('RELAY_RATE_LIMIT_DIR') ?: __DIR__ . '/storage/ratelimit';
+$snapshot_backup_path = getenv('RELAY_SNAPSHOT_BACKUP_PATH') ?: '';
 $path_template = getenv('RELAY_PATH_TEMPLATE') ?: '';
 $relay_mode = strtolower((string)(getenv('RELAY_MODE') ?: 'hybrid'));
 
@@ -30,6 +31,10 @@ if (!is_dir($access_log_dir)) {
 
 if (!is_dir($rate_limit_dir)) {
     @mkdir($rate_limit_dir, 0755, true);
+}
+
+if ($snapshot_backup_path !== '' && $snapshot_backup_path[0] !== '/') {
+    $snapshot_backup_path = __DIR__ . '/' . ltrim($snapshot_backup_path, '/');
 }
 
 // Runtime configuration for RelayService and SnapshotSeeder.
@@ -64,7 +69,7 @@ return [
     'transfer_timeout' => (int)(getenv('RELAY_TRANSFER_TIMEOUT') ?: 30),
     'curl_proxy' => getenv('RELAY_CURL_PROXY') ?: '',
     // Snapshot seeding and inject messages.
-    'snapshot_backup_path' => getenv('RELAY_SNAPSHOT_BACKUP_PATH') ?: '',
+    'snapshot_backup_path' => $snapshot_backup_path,
     'snapshot_base_url' => getenv('RELAY_SNAPSHOT_BASE_URL') ?: (getenv('CACHE_SOURCE_BASE_URL') ?: getenv('RELAY_UPSTREAM_BASE_URL') ?: ''),
     'snapshot_paths' => $snapshot_paths,
     'snapshot_ttl' => (int)(getenv('RELAY_SNAPSHOT_TTL') ?: 0),

@@ -4,7 +4,20 @@ $config = require __DIR__ . '/../config.php';
 
 session_start();
 
-$envPath = dirname(__DIR__) . '/.env';
+$envPath = null;
+$envCandidates = [
+    '/etc/hiddify-relay/.env',
+    dirname(__DIR__) . '/.env',
+];
+foreach ($envCandidates as $candidate) {
+    if (is_file($candidate)) {
+        $envPath = $candidate;
+        break;
+    }
+}
+if ($envPath === null) {
+    $envPath = dirname(__DIR__) . '/.env';
+}
 $refreshStatusPath = dirname(__DIR__) . '/storage/refresh-status.json';
 $refreshLogPath = dirname(__DIR__) . '/storage/refresh-cache.log';
 $upstreamStatusPath = dirname(__DIR__) . '/storage/upstream-status.json';
@@ -233,6 +246,12 @@ $neverExpireChecked = ((string)$currentCacheTtl === '-1')
     && ((string)$currentSnapshotTtl === '0')
     && ((string)$currentSnapshotAllowStale === '1')
     && ((string)$currentCacheAllowStale === '1');
+
+$refreshScriptPath = realpath(__DIR__ . '/../refresh-cache.php') ?: '';
+$refreshPhpBinary = resolve_php_binary();
+$cronSuggested = $currentCronInterval !== '' && $refreshScriptPath !== ''
+    ? '*/' . $currentCronInterval . ' * * * * ' . $refreshPhpBinary . ' ' . $refreshScriptPath . ' --force'
+    : 'Set RELAY_CRON_INTERVAL_MINUTES first';
 
 $refreshStatus = read_status($refreshStatusPath);
 $upstreamStatus = read_status($upstreamStatusPath);
@@ -784,7 +803,7 @@ function format_diagnostics(array $status): string
             <div class="row" style="margin-top: 12px;">
                 <div>
                     <label>Suggested cron</label>
-                    <div><code><?php echo h($currentCronInterval !== '' ? '*/' . $currentCronInterval . ' * * * * /usr/bin/php /path/to/HiRelay/apps/relay/refresh-cache.php --force' : 'Set RELAY_CRON_INTERVAL_MINUTES first'); ?></code></div>
+                    <div><code><?php echo h($cronSuggested); ?></code></div>
                 </div>
             </div>
             <div class="row" style="margin-top: 12px;">

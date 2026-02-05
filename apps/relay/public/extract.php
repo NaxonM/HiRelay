@@ -65,9 +65,9 @@ if ($customRoots !== '') {
 
 if ($accountUsername === '') {
     if (empty($customCandidates)) {
-        http_response_code(500);
+        http_response_code(404);
         echo json_encode([
-            'message' => 'HOST_ACCOUNT_USERNAME is not configured.',
+            'message' => 'Extract endpoint not configured for this host.',
             'timestamp' => date('c'),
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         exit;
