@@ -413,6 +413,36 @@ function resolve_php_binary(): string
     return 'php';
 }
 
+function detect_exec_blockers(string $phpBinary, string $script): array
+{
+    $messages = [];
+    $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+    if (in_array('shell_exec', $disabled, true) || in_array('exec', $disabled, true)) {
+        $messages[] = 'shell_exec/exec disabled in PHP-FPM.';
+    }
+
+    $openBasedir = (string)ini_get('open_basedir');
+    if ($openBasedir !== '') {
+        $allowed = array_filter(array_map('trim', explode(PATH_SEPARATOR, $openBasedir)));
+        $paths = array_filter([$phpBinary, $script]);
+        foreach ($paths as $path) {
+            $real = realpath($path) ?: $path;
+            $allowedHit = false;
+            foreach ($allowed as $base) {
+                if ($base !== '' && str_starts_with($real, $base)) {
+                    $allowedHit = true;
+                    break;
+                }
+            }
+            if (!$allowedHit && $allowed !== []) {
+                $messages[] = 'open_basedir blocks ' . $real . '.';
+            }
+        }
+    }
+
+    return $messages;
+}
+
 function run_refresh_cache(): array
 {
     $script = realpath(__DIR__ . '/../refresh-cache.php');
@@ -427,10 +457,19 @@ function run_refresh_cache(): array
     }
 
     $phpBinary = resolve_php_binary();
+    if (!is_file($phpBinary) || !is_executable($phpBinary)) {
+        return ['ok' => false, 'message' => 'PHP binary is not executable: ' . $phpBinary . '.'];
+    }
+
+    $blockers = detect_exec_blockers($phpBinary, $script);
+    if ($blockers !== []) {
+        return ['ok' => false, 'message' => implode(' ', $blockers) . ' Use CLI or cron.'];
+    }
+
     $command = escapeshellcmd($phpBinary) . ' ' . escapeshellarg($script) . ' --force --manual';
     $started = start_background_process($command, $GLOBALS['refreshLogPath']);
     if (!$started) {
-        return ['ok' => false, 'message' => 'Failed to execute refresh-cache.php.'];
+        return ['ok' => false, 'message' => 'Failed to execute refresh-cache.php. Try running: ' . $phpBinary . ' ' . $script . ' --force --manual'];
     }
 
     return ['ok' => true, 'message' => 'Cache refresh started.'];
