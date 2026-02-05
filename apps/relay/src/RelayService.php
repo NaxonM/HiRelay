@@ -149,15 +149,14 @@ class RelayService
             $this->clearFailover($cacheUrl);
         }
 
-        $response = $result['response'];
-        $rawResponse = $response;
+        $rawResponse = $result['response'];
+        $response = $rawResponse;
         if ($response !== '') {
             $response = $this->injectMessagesIntoResponse($response, $result['info']);
         }
-        $injected = $response !== $rawResponse;
 
         if ($this->config['cache_enabled'] && !$bypassCache && $httpCode === 200) {
-            $this->storeInCache($cacheUrl, $response, $result['info'], $injected);
+            $this->storeInCache($cacheUrl, $rawResponse, $result['info'], false, false);
             $this->maybeCleanupCache();
         }
 
@@ -282,7 +281,7 @@ class RelayService
         return ['body' => $content, 'meta' => $meta, 'snapshot_stale' => $stale];
     }
 
-    private function storeInCache(string $cacheUrl, string $response, array $info, bool $injected): void
+    private function storeInCache(string $cacheUrl, string $response, array $info, bool $injected, bool $isSnapshot): void
     {
         $key = md5($cacheUrl);
         $path = $this->config['cache_dir'] . '/' . $key;
@@ -296,6 +295,7 @@ class RelayService
             'content_type' => $info['content_type'] ?? 'application/octet-stream',
             'headers' => $this->headerListToArray($headers),
             'injected' => $injected,
+            'snapshot' => $isSnapshot,
         ]), LOCK_EX);
     }
 
@@ -333,7 +333,13 @@ class RelayService
         if (!empty($meta['injected'])) {
             return [];
         }
-        $messages = $this->config['live_inject_messages'] ?? [];
+        if (!empty($meta['inject_lines']) && is_array($meta['inject_lines'])) {
+            $messages = $meta['inject_lines'];
+        } elseif (!empty($meta['snapshot'])) {
+            $messages = $this->config['snapshot_inject_messages'] ?? [];
+        } else {
+            $messages = $this->config['live_inject_messages'] ?? [];
+        }
         if (!is_array($messages) || $messages === []) {
             return [];
         }
@@ -356,9 +362,9 @@ class RelayService
             return false;
         }
 
-        $decoded = base64_decode($trimmed, true);
-        if ($decoded !== false) {
-            $decodedTrimmed = rtrim($decoded, "\r\n");
+        $decoded = $this->decodeBase64Payload($trimmed);
+        if ($decoded['valid']) {
+            $decodedTrimmed = rtrim($decoded['decoded'], "\r\n");
             return strpos($decodedTrimmed, $prefix) === 0;
         }
 
@@ -626,6 +632,14 @@ class RelayService
         @file_put_contents($this->config['log_file'], $line, FILE_APPEND);
     }
 
+    private function debugLog(string $message): void
+    {
+        if (empty($this->config['debug_log_enabled'])) {
+            return;
+        }
+        $this->log('[debug] ' . $message);
+    }
+
     private function applySecurityHeaders(): void
     {
         if (empty($this->config['security_headers'])) {
@@ -847,16 +861,44 @@ class RelayService
             return $body;
         }
 
-        $decoded = base64_decode($trimmed, true);
-        if ($decoded !== false) {
-            $decodedTrimmed = rtrim($decoded, "\r\n");
+        $decoded = $this->decodeBase64Payload($trimmed);
+        if ($decoded['valid']) {
+            $decodedTrimmed = rtrim($decoded['decoded'], "\r\n");
             $prefixed = implode("\n", $messageLines) . "\n" . $decodedTrimmed . "\n";
-            return base64_encode($prefixed);
+            $encoded = base64_encode($prefixed);
+            if ($decoded['urlsafe']) {
+                $this->debugLog('Injected messages into urlsafe base64 payload.');
+                return rtrim(strtr($encoded, '+/', '-_'), '=');
+            }
+            $this->debugLog('Injected messages into base64 payload.');
+            return $encoded;
         }
+
+        $this->debugLog('Injected messages into plain-text payload.');
 
         $bodyTrimmed = rtrim($body, "\r\n");
         $prefixed = implode("\n", $messageLines) . "\n" . $bodyTrimmed . "\n";
         return $prefixed;
+    }
+
+    private function decodeBase64Payload(string $payload): array
+    {
+        $decoded = base64_decode($payload, true);
+        if ($decoded !== false) {
+            return ['valid' => true, 'decoded' => $decoded, 'urlsafe' => false];
+        }
+
+        $normalized = strtr($payload, '-_', '+/');
+        $padding = strlen($normalized) % 4;
+        if ($padding !== 0) {
+            $normalized .= str_repeat('=', 4 - $padding);
+        }
+        $decoded = base64_decode($normalized, true);
+        if ($decoded !== false) {
+            return ['valid' => true, 'decoded' => $decoded, 'urlsafe' => true];
+        }
+
+        return ['valid' => false, 'decoded' => '', 'urlsafe' => false];
     }
 
     private function shouldUseFailover(string $cacheUrl): bool
