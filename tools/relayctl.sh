@@ -10,6 +10,8 @@ CACHE_DIR="${CACHE_DIR:-${APP_DIR}/storage/cache}"
 LOG_FILE="${LOG_FILE:-${APP_DIR}/storage/relay.log}"
 REPO_URL="${REPO_URL:-https://github.com/NaxonM/HiRelay.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
+STATE_DIR="${STATE_DIR:-/var/lib/hiddify-relay}"
+INSTALLED_PKGS_FILE="${INSTALLED_PKGS_FILE:-${STATE_DIR}/installed-packages.txt}"
 SCRIPT_NAME="$(basename "$0")"
 PHP_FPM_UNITS=()
 IN_MENU=0
@@ -181,9 +183,21 @@ ensure_packages() {
     fi
 
     local packages=(git nginx php php-fpm php-cli php-curl certbot python3-certbot-nginx unzip rsync openssl)
+    local missing=()
+    for pkg in "${packages[@]}"; do
+        if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
+            missing+=("${pkg}")
+        fi
+    done
     echo "Installing required packages..."
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        mkdir -p "${STATE_DIR}"
+        printf "%s\n" "${missing[@]}" > "${INSTALLED_PKGS_FILE}"
+    else
+        rm -f "${INSTALLED_PKGS_FILE}" 2>/dev/null || true
+    fi
 }
 
 clone_or_update_repo() {
@@ -361,6 +375,41 @@ EOF
     ln -sf "${NGINX_SITE}" "${NGINX_LINK}"
 }
 
+write_nginx_ssl_config() {
+    local cert_path="$1"
+    local key_path="$2"
+
+    cat > "${NGINX_SITE}" <<EOF
+server {
+    listen 80;
+    server_name ${INSTALL_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${INSTALL_DOMAIN};
+
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+
+    root ${APP_DIR}/public;
+    index index.php;
+
+    location / {
+        try_files \$uri /index.php?\$args;
+    }
+
+    location ~ \\.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+}
+EOF
+    ln -sf "${NGINX_SITE}" "${NGINX_LINK}"
+}
+
 run_certbot() {
     if [[ "${SKIP_CERTBOT:-0}" == "1" ]]; then
         echo "SKIP_CERTBOT=1 set; skipping certificate issuance."
@@ -370,7 +419,55 @@ run_certbot() {
         echo "Domain or email not provided, skipping certbot." >&2
         return
     fi
-    certbot --nginx -d "${INSTALL_DOMAIN}" -m "${INSTALL_EMAIL}" --agree-tos --non-interactive --redirect
+    if certbot --nginx -d "${INSTALL_DOMAIN}" -m "${INSTALL_EMAIL}" --agree-tos --non-interactive --redirect; then
+        log_success "Certificate issued and nginx updated."
+        return
+    fi
+
+    log_warning "Certbot failed. Choose how to continue:"
+    while true; do
+        echo "  [S] Skip SSL for now"
+        echo "  [P] Provide existing certificate paths"
+        echo "  [R] Retry certbot"
+        read -rp "> " cert_choice
+        case "${cert_choice}" in
+            S|s)
+                log_warning "Skipping SSL setup. You can add it later."
+                return
+                ;;
+            P|p)
+                local cert_path
+                local key_path
+                read -rp "Fullchain certificate path: " cert_path
+                read -rp "Private key path: " key_path
+                if [[ -z "${cert_path}" || -z "${key_path}" ]]; then
+                    log_error "Both certificate and key paths are required."
+                    continue
+                fi
+                if [[ ! -r "${cert_path}" || ! -r "${key_path}" ]]; then
+                    log_error "Certificate or key file not readable. Check paths and permissions."
+                    continue
+                fi
+                write_nginx_ssl_config "${cert_path}" "${key_path}"
+                if nginx -t; then
+                    systemctl reload nginx
+                    log_success "Nginx updated with provided certificate."
+                    return
+                fi
+                log_error "Nginx config test failed. Please check the provided paths."
+                ;;
+            R|r)
+                if certbot --nginx -d "${INSTALL_DOMAIN}" -m "${INSTALL_EMAIL}" --agree-tos --non-interactive --redirect; then
+                    log_success "Certificate issued and nginx updated."
+                    return
+                fi
+                log_warning "Certbot failed again."
+                ;;
+            *)
+                log_error "Invalid choice."
+                ;;
+        esac
+    done
 }
 
 install_relay() {
@@ -848,6 +945,57 @@ remove_installation() {
     maybe_pause
 }
 
+purge_installation() {
+    read -rp "This will remove the relay installation and purge packages installed by this script. Continue? (y/N): " answer
+    case "${answer}" in
+        y|Y|yes|YES)
+            ;;
+        *)
+            echo "Aborted."
+            maybe_pause
+            return
+            ;;
+    esac
+
+    local had_nginx=0
+    if dpkg -s nginx >/dev/null 2>&1; then
+        had_nginx=1
+    fi
+
+    if [[ -L "${NGINX_LINK}" ]]; then
+        rm -f "${NGINX_LINK}"
+    fi
+    if [[ -f "${NGINX_SITE}" ]]; then
+        rm -f "${NGINX_SITE}"
+    fi
+    if [[ -d "${INSTALL_DIR}" ]]; then
+        rm -rf "${INSTALL_DIR}"
+    fi
+    if [[ -f "${ENV_PATH}" ]]; then
+        rm -f "${ENV_PATH}"
+    fi
+
+    if [[ -f "${INSTALLED_PKGS_FILE}" ]]; then
+        mapfile -t purge_pkgs < "${INSTALLED_PKGS_FILE}"
+        if [[ ${#purge_pkgs[@]} -gt 0 ]]; then
+            echo "Purging packages installed by this script..."
+            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "${purge_pkgs[@]}"
+            DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
+        fi
+    fi
+
+    if [[ -d "${STATE_DIR}" ]]; then
+        rm -rf "${STATE_DIR}"
+    fi
+
+    if [[ ${had_nginx} -eq 1 ]] && dpkg -s nginx >/dev/null 2>&1; then
+        systemctl reload nginx || true
+    fi
+
+    echo "Relay installation and tracked packages removed."
+    maybe_pause
+}
+
 show_usage() {
     cat <<EOF
 Usage: sudo ${SCRIPT_NAME} [command] [options]
@@ -864,6 +1012,7 @@ Commands:
   tail-logs         Follow relay logs in real-time
   update            Pull latest code from git in ${INSTALL_DIR}
   remove            Remove the relay installation
+    purge             Remove installation and packages installed by this script
   menu              Launch interactive menu (default)
   help              Show this message
 
@@ -900,7 +1049,8 @@ main_menu() {
         echo -e "${COLOR_CYAN} 9)${COLOR_RESET} Tail logs (live)"
         echo -e "${COLOR_CYAN}10)${COLOR_RESET} Update from git"
         echo -e "${COLOR_CYAN}11)${COLOR_RESET} Remove installation"
-        echo -e "${COLOR_CYAN}12)${COLOR_RESET} Exit\n"
+        echo -e "${COLOR_CYAN}12)${COLOR_RESET} Purge installation"
+        echo -e "${COLOR_CYAN}13)${COLOR_RESET} Exit\n"
         echo -ne "${COLOR_YELLOW}Select an option:${COLOR_RESET} "
         read -r choice
         case "${choice}" in
@@ -915,7 +1065,8 @@ main_menu() {
             9) tail_logs ;;
             10) update_from_git ;;
             11) remove_installation ;;
-            12) log_info "Goodbye."; exit 0 ;;
+            12) purge_installation ;;
+            13) log_info "Goodbye."; exit 0 ;;
             *) log_error "Invalid choice."; maybe_pause ;;
         esac
     done
@@ -959,6 +1110,9 @@ main() {
             ;;
         remove)
             remove_installation
+            ;;
+        purge)
+            purge_installation
             ;;
         menu)
             main_menu
