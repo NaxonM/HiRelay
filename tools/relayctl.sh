@@ -138,10 +138,18 @@ format_bytes() {
 
 load_env_settings() {
     if [[ -f "${ENV_PATH}" ]]; then
+        local had_nounset=0
+        if [[ $- == *u* ]]; then
+            had_nounset=1
+            set +u
+        fi
         set -a
         # shellcheck disable=SC1090
         source "${ENV_PATH}"
         set +a
+        if [[ ${had_nounset} -eq 1 ]]; then
+            set -u
+        fi
     fi
 }
 
