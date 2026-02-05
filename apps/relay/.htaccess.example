@@ -1,0 +1,33 @@
+RewriteEngine On
+
+# Redirect all requests to public directory
+RewriteCond %{REQUEST_URI} !^/public/
+RewriteCond %{REQUEST_URI} !^/extract\.php$
+RewriteRule ^(.*)$ public/$1 [L]
+
+# Security: Block access to sensitive directories
+RedirectMatch 403 ^/bootstrap\.php$
+RedirectMatch 403 ^/config\.php$
+RedirectMatch 403 ^/storage/
+RedirectMatch 403 ^/src/
+
+# Block access to sensitive files
+<FilesMatch "\.(ini|log|json|env)$">
+    Require all denied
+</FilesMatch>
+
+AddDefaultCharset UTF-8
+Options -Indexes
+
+# Example environment configuration for cPanel (uncomment and adjust)
+# SetEnv RELAY_MODE "hybrid"
+# SetEnv RELAY_UPSTREAM_BASE_URL "https://sub.example.com/"
+# SetEnv CACHE_SOURCE_BASE_URL "https://sub.example.com"
+# SetEnv CACHE_ALLOW_STALE "1"
+# SetEnv RELAY_BACKUP_API_URL "https://panel.example.com/<token>/api/v2/admin/user/"
+# SetEnv RELAY_BACKUP_API_KEY "<api-key>"
+# SetEnv RELAY_BACKUP_PROXY ""
+# SetEnv RELAY_SNAPSHOT_BACKUP_PATH "storage/cache/backup.json"
+# SetEnv EXTRACT_TOKEN "change-me"
+# SetEnv HOST_ACCOUNT_USERNAME "cpaneluser"
+# SetEnv FTP_CACHE_ROOT_PATH "/home/cpaneluser/example.com/public_ftp"
