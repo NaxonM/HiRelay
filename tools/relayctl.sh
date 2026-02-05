@@ -2,14 +2,14 @@
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/hiddify-relay}"
-APP_DIR="${APP_DIR:-${INSTALL_DIR}/HiRelay/apps/relay}"
+APP_DIR="${APP_DIR:-${INSTALL_DIR}/apps/relay}"
 ENV_PATH="${ENV_PATH:-/etc/hiddify-relay/.env}"
 NGINX_SITE="${NGINX_SITE:-/etc/nginx/sites-available/hiddify-relay.conf}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/hiddify-relay.conf}"
 CACHE_DIR="${CACHE_DIR:-${APP_DIR}/storage/cache}"
 LOG_FILE="${LOG_FILE:-${APP_DIR}/storage/relay.log}"
-REPO_URL="${REPO_URL:-https://github.com/NaxonM/HiddifyPHPSite.git}"
-REPO_BRANCH="${REPO_BRANCH:-relay-vps}"
+REPO_URL="${REPO_URL:-https://github.com/NaxonM/HiRelay.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
 SCRIPT_NAME="$(basename "$0")"
 PHP_FPM_UNITS=()
 IN_MENU=0
@@ -56,7 +56,7 @@ log_header() {
 # Encourage downloading before execution to preserve TTY
 if [[ -p /dev/stdin && "${ALLOW_PIPE_EXECUTION:-0}" != "1" ]]; then
     log_error "Direct pipe execution detected."
-    log_error "Use: sudo bash -c 'curl -fsSLo /tmp/relayctl.sh https://raw.githubusercontent.com/NaxonM/HiddifyPHPSite/relay-vps/relayctl.sh && chmod +x /tmp/relayctl.sh && /tmp/relayctl.sh menu'"
+    log_error "Use: sudo bash -c 'curl -fsSLo /tmp/relayctl.sh https://raw.githubusercontent.com/NaxonM/HiRelay/main/tools/relayctl.sh && chmod +x /tmp/relayctl.sh && /tmp/relayctl.sh menu'"
     log_error "(Set ALLOW_PIPE_EXECUTION=1 to override this safety check.)"
     exit 1
 fi
