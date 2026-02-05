@@ -86,7 +86,6 @@ return [
         getenv('RELAY_LIVE_INJECT_1') ?: '',
         getenv('RELAY_LIVE_INJECT_2') ?: '',
     ], static fn ($value) => is_string($value) && $value !== '')),
-    'inject_on_live_fetch' => (getenv('RELAY_INJECT_ON_LIVE_FETCH') ?: '0') === '1',
     'snapshot_manifest' => getenv('RELAY_SNAPSHOT_MANIFEST') ?: $cache_dir . '/snapshot_manifest.json',
     'snapshot_allow_stale' => (getenv('RELAY_SNAPSHOT_ALLOW_STALE') ?: '1') === '1',
     'cache_allow_stale' => (getenv('CACHE_ALLOW_STALE') ?: (getenv('RELAY_SNAPSHOT_ALLOW_STALE') ?: '1')) === '1',
