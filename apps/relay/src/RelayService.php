@@ -151,15 +151,10 @@ class RelayService
 
         $response = $result['response'];
         $rawResponse = $response;
-        $injected = false;
-
-        // Only inject on live fetches if explicitly enabled (default: disabled for safety)
-        // Safe injection happens during snapshot pre-caching phase with complete data
-        $shouldInjectOnLive = ($this->config['inject_on_live_fetch'] ?? false) === true;
-        if ($response !== '' && $shouldInjectOnLive) {
+        if ($response !== '') {
             $response = $this->injectMessagesIntoResponse($response, $result['info']);
-            $injected = $response !== $rawResponse;
         }
+        $injected = $response !== $rawResponse;
 
         if ($this->config['cache_enabled'] && !$bypassCache && $httpCode === 200) {
             $this->storeInCache($cacheUrl, $response, $result['info'], $injected);
