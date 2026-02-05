@@ -216,8 +216,14 @@ clone_or_update_repo() {
 ensure_storage_permissions() {
     mkdir -p "${APP_DIR}/storage/cache"
     mkdir -p "${APP_DIR}/storage/logs"
+    mkdir -p "$(dirname "${LOG_FILE}")"
+    if [[ ! -f "${LOG_FILE}" ]]; then
+        touch "${LOG_FILE}"
+    fi
     chown -R www-data:www-data "${APP_DIR}/storage"
+    chown www-data:www-data "${LOG_FILE}" 2>/dev/null || true
     chmod 750 "${APP_DIR}/storage"
+    chmod 640 "${LOG_FILE}" 2>/dev/null || true
 }
 
 prompt_install_values() {
@@ -1004,7 +1010,8 @@ Commands:
   install           Install or reinstall the relay (interactive prompts)
   status [--json]   Show relay status information (optionally as JSON)
     monitor           Display detailed metrics and upstream health
-  config            Edit configuration file (${ENV_PATH})
+    config            Edit configuration file (${ENV_PATH})
+    env               Alias for config
   reload            Reload nginx and php-fpm services
   enable-site       Enable nginx site and reload nginx
   disable-site      Disable nginx site and reload nginx
@@ -1041,7 +1048,7 @@ main_menu() {
         echo -e "${COLOR_CYAN} 1)${COLOR_RESET} Install or update relay"
         echo -e "${COLOR_CYAN} 2)${COLOR_RESET} Show status"
         echo -e "${COLOR_CYAN} 3)${COLOR_RESET} Monitoring dashboard"
-        echo -e "${COLOR_CYAN} 4)${COLOR_RESET} Edit configuration"
+        echo -e "${COLOR_CYAN} 4)${COLOR_RESET} Edit .env configuration"
         echo -e "${COLOR_CYAN} 5)${COLOR_RESET} Reload nginx and php-fpm"
         echo -e "${COLOR_CYAN} 6)${COLOR_RESET} Enable relay site"
         echo -e "${COLOR_CYAN} 7)${COLOR_RESET} Disable relay site"
@@ -1087,7 +1094,7 @@ main() {
         monitor)
             monitoring_dashboard
             ;;
-        config)
+        config|env)
             edit_configuration
             ;;
         reload)
