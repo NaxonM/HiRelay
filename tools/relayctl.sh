@@ -65,6 +65,46 @@ set_env_value() {
     fi
 }
 
+get_env_value() {
+    local key="$1"
+    if [[ -f "${ENV_PATH}" ]]; then
+        grep -E "^${key}=" "${ENV_PATH}" 2>/dev/null | head -n 1 | cut -d'=' -f2-
+    fi
+}
+
+ensure_env_defaults() {
+    local php_binary
+    local backup_url
+    local snapshot_path
+
+    if command -v php >/dev/null 2>&1; then
+        php_binary=$(command -v php)
+    else
+        php_binary=""
+    fi
+
+    set_env_value "RELAY_CACHE_DIR" "${APP_DIR}/storage/cache"
+    set_env_value "RELAY_LOG_FILE" "${APP_DIR}/storage/relay.log"
+    set_env_value "RELAY_ACCESS_LOG_FILE" "${APP_DIR}/storage/access.log"
+    set_env_value "RELAY_RATE_LIMIT_DIR" "${APP_DIR}/storage/ratelimit"
+    set_env_value "RELAY_SNAPSHOT_BACKUP_PATH" "${APP_DIR}/storage/cache/backup.json"
+
+    if [[ -n "${php_binary}" ]]; then
+        set_env_value "RELAY_PHP_BINARY" "${php_binary}"
+    fi
+
+    backup_url=$(get_env_value "RELAY_BACKUP_API_URL")
+    if [[ -z "${backup_url}" || "${backup_url}" == *"CHANGEME"* ]]; then
+        set_env_value "RELAY_CRON_ENABLED" "0"
+        log_warning "RELAY_BACKUP_API_URL is missing or a placeholder; cron refresh disabled."
+    fi
+
+    snapshot_path=$(get_env_value "RELAY_SNAPSHOT_BACKUP_PATH")
+    if [[ -n "${snapshot_path}" && "${snapshot_path}" != /* ]]; then
+        set_env_value "RELAY_SNAPSHOT_BACKUP_PATH" "${APP_DIR}/${snapshot_path#./}"
+    fi
+}
+
 # Encourage downloading before execution to preserve TTY
 if [[ -p /dev/stdin && "${ALLOW_PIPE_EXECUTION:-0}" != "1" ]]; then
     log_error "Direct pipe execution detected."
@@ -390,6 +430,8 @@ write_env_file() {
     if [[ -n "${php_binary}" ]]; then
         set_env_value "RELAY_PHP_BINARY" "${php_binary}"
     fi
+
+    ensure_env_defaults
 
     chmod 640 "${ENV_PATH}"
     chown root:www-data "${ENV_PATH}" 2>/dev/null || true
@@ -885,6 +927,7 @@ edit_configuration() {
     fi
     local editor="${EDITOR:-nano}"
     "${editor}" "${ENV_PATH}"
+    ensure_env_defaults
     maybe_pause
 }
 
