@@ -55,6 +55,16 @@ log_header() {
     echo -e "\n${COLOR_BOLD}${COLOR_BLUE}=== $* ===${COLOR_RESET}\n"
 }
 
+set_env_value() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^${key}=" "${ENV_PATH}" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "${ENV_PATH}"
+    else
+        echo "${key}=${value}" >> "${ENV_PATH}"
+    fi
+}
+
 # Encourage downloading before execution to preserve TTY
 if [[ -p /dev/stdin && "${ALLOW_PIPE_EXECUTION:-0}" != "1" ]]; then
     log_error "Direct pipe execution detected."
@@ -339,21 +349,48 @@ prompt_install_values() {
 }
 
 write_env_file() {
+    local timezone=""
+    local php_binary=""
+
+    if command -v timedatectl >/dev/null 2>&1; then
+        timezone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    elif [[ -f /etc/timezone ]]; then
+        timezone=$(cat /etc/timezone 2>/dev/null || true)
+    fi
+    if command -v php >/dev/null 2>&1; then
+        php_binary=$(command -v php)
+    fi
+
     mkdir -p "$(dirname "${ENV_PATH}")"
-    cat > "${ENV_PATH}" <<EOF
-RELAY_UPSTREAM_BASE_URL=${INSTALL_UPSTREAM}
-RELAY_AUTH_TOKEN=${INSTALL_TOKEN}
-RELAY_ALLOWED_CLIENTS=${INSTALL_ALLOWED}
-RELAY_CACHE_ENABLED=1
-RELAY_CACHE_TTL=${INSTALL_CACHE_TTL}
-RELAY_CONNECT_TIMEOUT=10
-RELAY_TRANSFER_TIMEOUT=60
-RELAY_CACHE_DIR=${APP_DIR}/storage/cache
-RELAY_LOG_FILE=${APP_DIR}/storage/relay.log
-RELAY_ACCESS_LOG_FILE=${APP_DIR}/storage/access.log
-RELAY_DOMAIN=${INSTALL_DOMAIN}
-RELAY_ADMIN_EMAIL=${INSTALL_EMAIL}
-EOF
+    if [[ -f "${APP_DIR}/.env.example" ]]; then
+        cp "${APP_DIR}/.env.example" "${ENV_PATH}"
+    else
+        : > "${ENV_PATH}"
+    fi
+
+    set_env_value "RELAY_UPSTREAM_BASE_URL" "${INSTALL_UPSTREAM}"
+    set_env_value "CACHE_SOURCE_BASE_URL" "${INSTALL_UPSTREAM}"
+    set_env_value "RELAY_AUTH_TOKEN" "${INSTALL_TOKEN}"
+    set_env_value "RELAY_ALLOWED_CLIENTS" "${INSTALL_ALLOWED}"
+    set_env_value "RELAY_CACHE_TTL" "${INSTALL_CACHE_TTL}"
+    set_env_value "RELAY_CONNECT_TIMEOUT" "10"
+    set_env_value "RELAY_TRANSFER_TIMEOUT" "60"
+    set_env_value "RELAY_CACHE_DIR" "${APP_DIR}/storage/cache"
+    set_env_value "RELAY_LOG_FILE" "${APP_DIR}/storage/relay.log"
+    set_env_value "RELAY_ACCESS_LOG_FILE" "${APP_DIR}/storage/access.log"
+    set_env_value "RELAY_RATE_LIMIT_DIR" "${APP_DIR}/storage/ratelimit"
+    set_env_value "RELAY_SNAPSHOT_BACKUP_PATH" "${APP_DIR}/storage/cache/backup.json"
+    set_env_value "RELAY_SNAPSHOT_BASE_URL" "${INSTALL_UPSTREAM}"
+    set_env_value "RELAY_DOMAIN" "${INSTALL_DOMAIN}"
+    set_env_value "RELAY_ADMIN_EMAIL" "${INSTALL_EMAIL}"
+
+    if [[ -n "${timezone}" ]]; then
+        set_env_value "RELAY_TIMEZONE" "${timezone}"
+    fi
+    if [[ -n "${php_binary}" ]]; then
+        set_env_value "RELAY_PHP_BINARY" "${php_binary}"
+    fi
+
     chmod 640 "${ENV_PATH}"
     chown root:www-data "${ENV_PATH}" 2>/dev/null || true
 }
