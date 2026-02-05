@@ -1,24 +1,39 @@
 # HiRelay
 
-Unified relay service that can serve live, cold (prewarmed), or hybrid cache modes.
+HiRelay is a unified relay service that can run in live, cold (prewarmed), or hybrid cache modes. The deployable app lives in `apps/relay` and should be identical between cPanel and VPS deployments.
 
-## Structure
-- apps/relay/ -> unified runtime (live/cold/hybrid)
-- apps/relay/public/ -> web root entrypoints
-- apps/relay/src/ -> runtime classes
-- apps/relay/storage/cache/ -> cached payloads and .meta files
-- tools/ -> automation scripts and sample data
-- docs/ -> consolidated documentation
-- legacy/ -> legacy projects (kept for reference)
+## Repo layout
+- `apps/relay/` -> deployable app (copy these contents to your web root on cPanel)
+- `apps/relay/public/` -> web root entrypoints
+- `apps/relay/src/` -> runtime classes
+- `apps/relay/storage/` -> cache/log storage (local only)
+- `tools/` -> automation scripts (VPS + cache tooling)
 
-## Quick start (cPanel)
-1. Upload the HiRelay folder to your hosting.
-2. Set the document root to HiRelay/apps/relay/public.
-3. Add a .env in HiRelay/apps/relay/ with the required variables.
-4. Optional: copy apps/relay/.htaccess.example to apps/relay/.htaccess and edit envs.
+## Deploy model
+### cPanel
+- Copy the contents of `apps/relay/` into your host directory (e.g. `enter/`).
+- Ensure the web root points to `public/`.
+- Create a `.env` next to `public/` using `apps/relay/.env.example` as the template.
+- Optionally copy `apps/relay/.htaccess.example` to `.htaccess` and adjust envs.
+
+### VPS
+Use the control script in `tools/relayctl.sh`. It deploys the repo and serves `apps/relay/public` via nginx.
+
+Fetch the latest `relayctl.sh` from the repo:
+```bash
+curl -fsSL https://raw.githubusercontent.com/NaxonM/HiRelay/main/tools/relayctl.sh -o relayctl.sh
+chmod +x relayctl.sh
+```
+
+## Configuration
+- Do not commit `.env` or secrets.
+- Use `apps/relay/.env.example` as the base.
+- Logs and cache live in `apps/relay/storage/` (not committed).
 
 ## Quick start (local)
-- php -S 0.0.0.0:8080 -t apps/relay/public
+```bash
+php -S 0.0.0.0:8080 -t apps/relay/public
+```
 
 ## Environment variables
 - RELAY_UPSTREAM_BASE_URL: Upstream server base URL (required for live/hybrid)
@@ -93,3 +108,7 @@ Example cron entry:
 Set RELAY_ADMIN_PASSWORD_HASH to a bcrypt/argon hash to enable login on /admin.
 Use a PHP one-liner to generate a hash:
 - php -r "echo password_hash('your-password', PASSWORD_DEFAULT);"
+
+## Notes
+- The PowerShell cache automation is intended for cPanel deployments.
+- VPS deployment uses relayctl.sh; ensure APP_DIR points to apps/relay if you customize paths.
