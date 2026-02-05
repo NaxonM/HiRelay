@@ -327,7 +327,8 @@ function update_env(string $path, array $updates): array
 
     $content = implode("\n", $lines) . "\n";
     if (file_put_contents($path, $content) === false) {
-        return ['ok' => false, 'message' => 'Unable to write .env file.'];
+        $fix = 'Fix permissions using: sudo relayctl.sh config';
+        return ['ok' => false, 'message' => 'Unable to write .env file. ' . $fix];
     }
 
     apply_env_updates($updates);
@@ -469,7 +470,12 @@ function run_refresh_cache(): array
     $command = escapeshellcmd($phpBinary) . ' ' . escapeshellarg($script) . ' --force --manual';
     $started = start_background_process($command, $GLOBALS['refreshLogPath']);
     if (!$started) {
-        return ['ok' => false, 'message' => 'Failed to execute refresh-cache.php. Try running: ' . $phpBinary . ' ' . $script . ' --force --manual'];
+        $envPath = $GLOBALS['envPath'] ?? '';
+        $suggestion = 'Try running: ' . $phpBinary . ' ' . $script . ' --force --manual';
+        if ($envPath && !is_writable($envPath)) {
+            $suggestion .= '. Or fix .env permissions: sudo relayctl.sh config';
+        }
+        return ['ok' => false, 'message' => 'Failed to execute refresh-cache.php. ' . $suggestion];
     }
 
     return ['ok' => true, 'message' => 'Cache refresh started.'];
