@@ -441,7 +441,7 @@ write_env_file() {
 
     ensure_env_defaults
 
-    chmod 640 "${ENV_PATH}"
+    chmod 660 "${ENV_PATH}"
     chown root:www-data "${ENV_PATH}" 2>/dev/null || true
 }
 
@@ -930,7 +930,7 @@ edit_configuration() {
         else
             touch "${ENV_PATH}"
         fi
-        chmod 640 "${ENV_PATH}"
+        chmod 660 "${ENV_PATH}"
         chown root:www-data "${ENV_PATH}" 2>/dev/null || true
     fi
     local editor="${EDITOR:-nano}"
