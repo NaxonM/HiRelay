@@ -1,0 +1,8 @@
+# Secrets
+**/.env
+**/.htaccess
+/tools/Update-Cache.config.ps1
+
+# Non-deployable or archived content
+/docs/
+/legacy/
