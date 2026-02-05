@@ -284,6 +284,13 @@ ensure_storage_permissions() {
     chmod 640 "${LOG_FILE}" 2>/dev/null || true
 }
 
+ensure_env_permissions() {
+    if [[ -f "${ENV_PATH}" ]]; then
+        chmod 660 "${ENV_PATH}" 2>/dev/null || true
+        chown root:www-data "${ENV_PATH}" 2>/dev/null || true
+    fi
+}
+
 prompt_install_values() {
     local default_domain="${DOMAIN:-}"
     local default_email="${EMAIL:-}"
@@ -580,6 +587,7 @@ install_relay() {
         ensure_packages
         clone_or_update_repo
         ensure_storage_permissions
+        ensure_env_permissions
         nginx -t
         systemctl reload nginx
         reload_php_units
@@ -935,6 +943,7 @@ edit_configuration() {
     fi
     local editor="${EDITOR:-nano}"
     "${editor}" "${ENV_PATH}"
+    ensure_env_permissions
     ensure_env_defaults
     maybe_pause
 }
