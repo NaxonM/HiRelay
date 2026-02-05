@@ -266,10 +266,7 @@ class SnapshotSeeder
             ];
         }
 
-        $rawResponse = $response;
-        $response = $this->injectMessagesIntoResponse($response, $info);
-        $injected = $response !== $rawResponse;
-        $this->storeCache($url, $response, $info, $injected);
+        $this->storeCache($url, $response, $info, false);
 
         return [
             'path' => $path,
@@ -429,10 +426,7 @@ class SnapshotSeeder
                             ];
                         }
                     } else {
-                        $rawResponse = $response;
-                        $response = $this->injectMessagesIntoResponse($response, $infoData);
-                        $injected = $response !== $rawResponse;
-                        $this->storeCache($item['url'], $response, $infoData, $injected);
+                        $this->storeCache($item['url'], $response, $infoData, false);
                         $results[] = [
                             'path' => $item['path'],
                             'uuid' => $item['uuid'],
@@ -466,12 +460,16 @@ class SnapshotSeeder
         $headers = substr($response, 0, $headerSize);
         $body = substr($response, $headerSize);
 
+        $injectLines = $this->prepareMessageLines($this->config['snapshot_inject_messages'] ?? []);
+
         @file_put_contents($cachePath, $body, LOCK_EX);
         @file_put_contents($cachePath . '.meta', json_encode([
             'http_code' => $info['http_code'] ?? 200,
             'content_type' => $info['content_type'] ?? 'application/octet-stream',
             'headers' => $this->headerListToArray($headers),
             'injected' => $injected,
+            'snapshot' => true,
+            'inject_lines' => $injectLines,
         ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
     }
 
@@ -482,7 +480,7 @@ class SnapshotSeeder
             return $response;
         }
 
-        $messageLines = array_values(array_filter(array_map('trim', $messages), static fn ($value) => $value !== ''));
+        $messageLines = $this->prepareMessageLines($messages);
         if ($messageLines === []) {
             return $response;
         }
@@ -506,16 +504,58 @@ class SnapshotSeeder
             return $body;
         }
 
-        $decoded = base64_decode($trimmed, true);
-        if ($decoded !== false) {
-            $decodedTrimmed = rtrim($decoded, "\r\n");
+        $decoded = $this->decodeBase64Payload($trimmed);
+        if ($decoded['valid']) {
+            $decodedTrimmed = rtrim($decoded['decoded'], "\r\n");
             $prefixed = implode("\n", $messageLines) . "\n" . $decodedTrimmed . "\n";
-            return base64_encode($prefixed);
+            $encoded = base64_encode($prefixed);
+            if ($decoded['urlsafe']) {
+                $this->debugLog('Injected messages into urlsafe base64 payload.');
+                return rtrim(strtr($encoded, '+/', '-_'), '=');
+            }
+            $this->debugLog('Injected messages into base64 payload.');
+            return $encoded;
         }
+
+        $this->debugLog('Injected messages into plain-text payload.');
 
         $bodyTrimmed = rtrim($body, "\r\n");
         $prefixed = implode("\n", $messageLines) . "\n" . $bodyTrimmed . "\n";
         return $prefixed;
+    }
+
+    private function prepareMessageLines(array $messages): array
+    {
+        return array_values(array_filter(array_map('trim', $messages), static fn ($value) => $value !== ''));
+    }
+
+    private function decodeBase64Payload(string $payload): array
+    {
+        $decoded = base64_decode($payload, true);
+        if ($decoded !== false) {
+            return ['valid' => true, 'decoded' => $decoded, 'urlsafe' => false];
+        }
+
+        $normalized = strtr($payload, '-_', '+/');
+        $padding = strlen($normalized) % 4;
+        if ($padding !== 0) {
+            $normalized .= str_repeat('=', 4 - $padding);
+        }
+        $decoded = base64_decode($normalized, true);
+        if ($decoded !== false) {
+            return ['valid' => true, 'decoded' => $decoded, 'urlsafe' => true];
+        }
+
+        return ['valid' => false, 'decoded' => '', 'urlsafe' => false];
+    }
+
+    private function debugLog(string $message): void
+    {
+        if (empty($this->config['debug_log_enabled'])) {
+            return;
+        }
+        $line = date('c') . ' [debug] ' . $message . "\n";
+        @file_put_contents($this->config['log_file'], $line, FILE_APPEND);
     }
 
     private function headerListToArray(string $headers): array

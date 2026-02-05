@@ -89,6 +89,7 @@ return [
     'snapshot_manifest' => getenv('RELAY_SNAPSHOT_MANIFEST') ?: $cache_dir . '/snapshot_manifest.json',
     'snapshot_allow_stale' => (getenv('RELAY_SNAPSHOT_ALLOW_STALE') ?: '1') === '1',
     'cache_allow_stale' => (getenv('CACHE_ALLOW_STALE') ?: (getenv('RELAY_SNAPSHOT_ALLOW_STALE') ?: '1')) === '1',
+    'debug_log_enabled' => (getenv('RELAY_DEBUG_LOG') ?: '0') === '1',
     // Path template and relay mode.
     'path_template' => $path_template,
     'mode' => $relay_mode,
