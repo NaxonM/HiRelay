@@ -6,3 +6,15 @@
 # Non-deployable or archived content
 /docs/
 /legacy/
+
+# Ignore archive and sensitive cache files
+# archive built by tooling
+relay.zip
+
+# Ignore runtime cache data (actual cached payloads)
+# matches both project-level and app-level storage/cache directories
+**/storage/cache/
+**/storage/cache/**
+
+# already ignore .env files above; also ignore any env backups
+**/.env.*
