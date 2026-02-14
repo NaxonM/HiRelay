@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 # relayctl.sh – Hiddify Relay control script
-# Hardened version: HAProxy-aware, correct FPM socket detection,
-# DNS-01 / standalone certbot, safe sed, idempotent installs.
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/hiddify-relay}"
@@ -44,13 +42,12 @@ else
 fi
 
 log_info()    { echo -e "${COLOR_CYAN}[INFO]${COLOR_RESET} $*"; }
-log_success() { echo -e "${COLOR_GREEN}[✓]${COLOR_RESET} $*"; }
+log_success() { echo -e "${COLOR_GREEN}[OK]${COLOR_RESET} $*"; }
 log_error()   { echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2; }
 log_warning() { echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"; }
 log_header()  { echo -e "\n${COLOR_BOLD}${COLOR_BLUE}=== $* ===${COLOR_RESET}\n"; }
 
 # ── Pipe / TTY guard ───────────────────────────────────────────────────────────
-# Discourage execution via raw pipe so the TTY is preserved for prompts.
 if [[ -p /dev/stdin && "${ALLOW_PIPE_EXECUTION:-0}" != "1" ]]; then
     log_error "Direct pipe execution detected."
     log_error "Use: sudo bash -c 'curl -fsSLo /tmp/relayctl.sh \\"
@@ -78,7 +75,6 @@ require_root() {
 }
 
 press_enter() { read -rp "Press Enter to continue..." _; }
-
 maybe_pause() { [[ ${IN_MENU} -eq 1 ]] && press_enter; }
 
 format_bytes() {
@@ -95,27 +91,39 @@ validate_url() {
     [[ "$1" =~ ^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$ ]]
 }
 
+# FIX #14: require at least one dot so single-label hostnames (which can never
+# get a Let's Encrypt cert) are rejected at prompt time.
 validate_domain() {
-    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
 }
 
 validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
 }
 
-# Safe sed-based key=value writer.
-# FIX: previous version used '|' as separator; a value containing '|' broke it.
-# We now use a null-byte-free Python one-liner which handles any printable value.
+# ── Safe .env writer ───────────────────────────────────────────────────────────
+# FIX #1: replaced the broken sed escape pipeline with a Python rewriter that
+# never treats the value as a regex or sed replacement expression.  Both the
+# update and append paths produce identical bytes for any value content.
 set_env_value() {
     local key="$1"
     local value="$2"
-    # Escape characters that would confuse sed's replacement side: & \ newline
-    local escaped_value
-    escaped_value=$(printf '%s' "${value}" | sed -e 's/[&\\/]/\\&/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//')
     if grep -q "^${key}=" "${ENV_PATH}" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${escaped_value}|" "${ENV_PATH}"
+        python3 -c "
+import sys, os, tempfile
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+new_line = key + '=' + value + '\n'
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, 'w') as fout, open(path) as fin:
+        for line in fin:
+            fout.write(new_line if line.startswith(key + '=') else line)
+    os.replace(tmp, path)
+except Exception:
+    os.unlink(tmp)
+    raise
+" "${ENV_PATH}" "${key}" "${value}"
     else
-        # Use printf to avoid issues with values that look like escape sequences
         printf '%s=%s\n' "${key}" "${value}" >> "${ENV_PATH}"
     fi
 }
@@ -125,15 +133,24 @@ get_env_value() {
     [[ -f "${ENV_PATH}" ]] && grep -E "^${key}=" "${ENV_PATH}" 2>/dev/null | head -n 1 | cut -d'=' -f2-
 }
 
-# Source .env safely, even when set -u is active.
+# FIX #12: safe line-by-line parser replaces 'source' so the .env file can
+# never execute arbitrary code even if somehow maliciously modified.
 load_env_settings() {
     [[ -f "${ENV_PATH}" ]] || return 0
     local had_nounset=0
     [[ $- == *u* ]] && { had_nounset=1; set +u; }
-    set -a
-    # shellcheck disable=SC1090
-    source "${ENV_PATH}"
-    set +a
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+        if [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            local k="${BASH_REMATCH[1]}"
+            local v="${BASH_REMATCH[2]}"
+            # Strip surrounding single or double quotes
+            if [[ "${v}" =~ ^\"(.*)\"$ ]] || [[ "${v}" =~ ^\'(.*)\'$ ]]; then
+                v="${BASH_REMATCH[1]}"
+            fi
+            export "${k}=${v}"
+        fi
+    done < "${ENV_PATH}"
     [[ ${had_nounset} -eq 1 ]] && set -u
 }
 
@@ -153,33 +170,29 @@ detect_existing_email() {
 }
 
 # ── PHP-FPM detection ──────────────────────────────────────────────────────────
-# FIX: detect the actual versioned unit AND resolve the real socket path.
+# FIX #2: systemctl list-unit-files always exits 0 even for non-existent units;
+# must grep its stdout to confirm the unit is actually registered.
 detect_php_units() {
     local candidates=("php8.4-fpm" "php8.3-fpm" "php8.2-fpm" "php8.1-fpm"
                       "php8.0-fpm" "php7.4-fpm" "php-fpm")
     PHP_FPM_UNITS=()
     PHP_FPM_SOCK=""
     for unit in "${candidates[@]}"; do
-        if systemctl list-unit-files "${unit}.service" &>/dev/null; then
+        if systemctl list-unit-files "${unit}.service" 2>/dev/null | grep -q "${unit}"; then
             PHP_FPM_UNITS+=("${unit}")
         fi
     done
-    # Resolve the best socket path from the first active versioned unit.
+    # Resolve the best socket: prefer one whose socket file already exists.
     for unit in "${PHP_FPM_UNITS[@]}"; do
-        local ver
+        local ver sock=""
         ver=$(echo "${unit}" | grep -oP 'php\K[0-9]+\.[0-9]+' || true)
-        local sock=""
-        if [[ -n "${ver}" ]]; then
-            sock="/run/php/php${ver}-fpm.sock"
-        fi
-        # Fallback: generic path used by some distros
-        [[ -z "${sock}" ]] && sock="/run/php/php-fpm.sock"
-        if [[ -S "${sock}" ]] || systemctl is-active "${unit}" &>/dev/null; then
-            PHP_FPM_SOCK="${sock}"
-            break
+        [[ -n "${ver}" ]] && sock="/run/php/php${ver}-fpm.sock" || sock="/run/php/php-fpm.sock"
+        if [[ -S "${sock}" ]]; then
+            PHP_FPM_SOCK="${sock}"; break
+        elif systemctl is-active "${unit}" &>/dev/null; then
+            [[ -z "${PHP_FPM_SOCK}" ]] && PHP_FPM_SOCK="${sock}"
         fi
     done
-    # Last-resort: try the generic path
     [[ -z "${PHP_FPM_SOCK}" && -S "/run/php/php-fpm.sock" ]] && \
         PHP_FPM_SOCK="/run/php/php-fpm.sock"
 }
@@ -201,28 +214,30 @@ reload_php_units() {
 }
 
 # ── Package management ─────────────────────────────────────────────────────────
-# FIX: install only truly missing packages; track what we added for purge.
-# NOTE: no apache2 — nginx is the only web server installed.
 ensure_packages() {
     if ! command -v apt-get >/dev/null 2>&1; then
         log_error "apt-get not found. This installer supports Debian/Ubuntu only."
         exit 1
     fi
 
-    # php-fpm meta-package may not install a versioned unit; add explicit version
-    # probing below.  We also install python3-certbot-nginx but that only works
-    # when nginx owns port 80 — see run_certbot() for the HAProxy-aware path.
     local packages=(git nginx php-cli php-curl certbot python3-certbot-nginx
                     unzip rsync openssl)
 
-    # Detect the highest available php-fpm version so we get the versioned unit.
+    # FIX #16: check dpkg first (no network needed) before falling back to
+    # apt-cache, which requires a fresh cache and internet access.
     local php_fpm_pkg=""
     for ver in 8.4 8.3 8.2 8.1 8.0 7.4; do
-        if apt-cache show "php${ver}-fpm" &>/dev/null 2>&1; then
-            php_fpm_pkg="php${ver}-fpm"
-            break
+        if dpkg -s "php${ver}-fpm" >/dev/null 2>&1; then
+            php_fpm_pkg="php${ver}-fpm"; break
         fi
     done
+    if [[ -z "${php_fpm_pkg}" ]]; then
+        for ver in 8.4 8.3 8.2 8.1 8.0 7.4; do
+            if apt-cache show "php${ver}-fpm" &>/dev/null 2>&1; then
+                php_fpm_pkg="php${ver}-fpm"; break
+            fi
+        done
+    fi
     [[ -n "${php_fpm_pkg}" ]] && packages+=("${php_fpm_pkg}") || packages+=("php-fpm")
 
     local missing=()
@@ -230,8 +245,8 @@ ensure_packages() {
         dpkg -s "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
     done
 
-    # Always record the full set of packages this script manages so that
-    # purge_installation can remove them even when all were pre-installed.
+    # Always record the full managed package set so purge works even when
+    # all packages were already present before this script ran.
     mkdir -p "${STATE_DIR}"
     for pkg in "${packages[@]}"; do
         grep -qxF "${pkg}" "${INSTALLED_PKGS_FILE}" 2>/dev/null || \
@@ -249,35 +264,70 @@ ensure_packages() {
 }
 
 # ── Repository management ──────────────────────────────────────────────────────
+# FIX #8: validate INSTALL_DIR is not a critical system path before rm -rf.
+_assert_safe_install_dir() {
+    local dir
+    dir="$(realpath -m "${INSTALL_DIR}" 2>/dev/null || echo "${INSTALL_DIR}")"
+    local unsafe=("/" "/usr" "/usr/local" "/var" "/etc" "/home" "/root"
+                  "/bin" "/sbin" "/lib" "/lib64" "/boot" "/proc" "/sys" "/dev" "/run")
+    for bad in "${unsafe[@]}"; do
+        if [[ "${dir}" == "${bad}" ]]; then
+            log_error "INSTALL_DIR='${INSTALL_DIR}' resolves to a critical system path. Aborting."
+            exit 1
+        fi
+    done
+    if [[ "${#dir}" -lt 4 ]]; then
+        log_error "INSTALL_DIR='${INSTALL_DIR}' is suspiciously short. Aborting."
+        exit 1
+    fi
+}
+
 clone_or_update_repo() {
+    _assert_safe_install_dir
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
         log_info "Updating repository in ${INSTALL_DIR}..."
         git -C "${INSTALL_DIR}" fetch --all --prune
         git -C "${INSTALL_DIR}" checkout "${REPO_BRANCH}"
-        # FIX: use reset --hard (same as install path) to handle diverged history
         git -C "${INSTALL_DIR}" reset --hard "origin/${REPO_BRANCH}"
     else
-        log_info "Cloning ${REPO_URL} (branch ${REPO_BRANCH}) → ${INSTALL_DIR}..."
+        log_info "Cloning ${REPO_URL} (branch ${REPO_BRANCH}) -> ${INSTALL_DIR}..."
         rm -rf "${INSTALL_DIR}"
         git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${INSTALL_DIR}"
     fi
 }
 
 # ── Permissions ────────────────────────────────────────────────────────────────
+# FIX #6: use 770 on storage dirs so www-data can actually write to them.
+# FIX #7: handle LOG_FILE that may be outside APP_DIR/storage when overridden.
 ensure_storage_permissions() {
+    local log_dir
+    log_dir="$(dirname "${LOG_FILE}")"
+
     mkdir -p "${APP_DIR}/storage/cache" \
              "${APP_DIR}/storage/logs" \
              "${APP_DIR}/storage/ratelimit" \
-             "$(dirname "${LOG_FILE}")"
+             "${log_dir}"
+
     [[ -f "${LOG_FILE}" ]] || touch "${LOG_FILE}"
+
     chown -R www-data:www-data "${APP_DIR}/storage"
-    chmod 750 "${APP_DIR}/storage"
+    chmod 770 "${APP_DIR}/storage" \
+              "${APP_DIR}/storage/cache" \
+              "${APP_DIR}/storage/logs" \
+              "${APP_DIR}/storage/ratelimit" 2>/dev/null || true
+
+    chown www-data:www-data "${LOG_FILE}" 2>/dev/null || true
     chmod 640 "${LOG_FILE}" 2>/dev/null || true
+
+    # If the log lives outside the storage tree, fix its parent dir too.
+    if [[ "${log_dir}" != "${APP_DIR}/storage"* ]]; then
+        chown www-data:www-data "${log_dir}" 2>/dev/null || true
+        chmod 770 "${log_dir}" 2>/dev/null || true
+    fi
 }
 
 ensure_env_permissions() {
     [[ -f "${ENV_PATH}" ]] || return 0
-    # FIX: 640 not 660 — www-data can read but not write secrets
     chmod 640 "${ENV_PATH}"
     chown root:www-data "${ENV_PATH}" 2>/dev/null || true
 }
@@ -290,7 +340,6 @@ ensure_env_defaults() {
     set_env_value "RELAY_LOG_FILE"             "${APP_DIR}/storage/relay.log"
     set_env_value "RELAY_ACCESS_LOG_FILE"      "${APP_DIR}/storage/access.log"
     set_env_value "RELAY_RATE_LIMIT_DIR"       "${APP_DIR}/storage/ratelimit"
-    # FIX: set backup path only once (removed duplicate relative-path fixup)
     set_env_value "RELAY_SNAPSHOT_BACKUP_PATH" "${APP_DIR}/storage/cache/backup.json"
 
     [[ -n "${php_binary}" ]] && set_env_value "RELAY_PHP_BINARY" "${php_binary}"
@@ -342,13 +391,12 @@ prompt_install_values() {
     if [[ "${NGINX_HTTP_PORT}" != "80" || "${NGINX_HTTPS_PORT}" != "443" ]]; then
         log_warning "Non-standard ports selected. Configure your HAProxy frontend to"
         log_warning "proxy to 127.0.0.1:${NGINX_HTTP_PORT} (HTTP) and 127.0.0.1:${NGINX_HTTPS_PORT} (HTTPS)."
-        # For certbot standalone we need a free port for the ACME challenge
         local default_acme="${ACME_HTTP_PORT}"
         [[ "${default_acme}" == "${NGINX_HTTP_PORT}" && "${NGINX_HTTP_PORT}" != "80" ]] && \
             default_acme="80"
         local input_acme
         while true; do
-            read -rp "  ACME challenge port (must be reachable as :80 from the internet) [${default_acme}]: " input_acme
+            read -rp "  ACME challenge port (must be reachable as :80 from internet) [${default_acme}]: " input_acme
             [[ -z "${input_acme}" ]] && input_acme="${default_acme}"
             validate_port "${input_acme}" && break
             log_error "Invalid port number."
@@ -360,7 +408,8 @@ prompt_install_values() {
     while [[ -z "${default_domain}" ]]; do
         echo -e "${COLOR_CYAN}Relay domain${COLOR_RESET} (e.g. ${COLOR_YELLOW}relay.example.com${COLOR_RESET})"
         read -rp "> " default_domain
-        validate_domain "${default_domain}" || { log_error "Invalid domain."; default_domain=""; }
+        validate_domain "${default_domain}" || \
+            { log_error "Invalid domain (must contain at least one dot, no IP addresses)."; default_domain=""; }
     done
 
     # ── Email ──────────────────────────────────────────────────────────────────
@@ -392,9 +441,7 @@ prompt_install_values() {
     echo -e "${COLOR_CYAN}Shared secret token${COLOR_RESET} (optional, press Enter to leave empty)"
     local input_token
     read -rp "> " input_token || true
-    if [[ -n "${input_token:-}" ]]; then
-        default_token="${input_token}"
-    fi
+    [[ -n "${input_token:-}" ]] && default_token="${input_token}"
 
     echo -e "${COLOR_CYAN}Allowed client IPs${COLOR_RESET} (comma-separated, blank = all)"
     echo -e "  Example: ${COLOR_YELLOW}1.2.3.4,5.6.7.8${COLOR_RESET}"
@@ -420,23 +467,32 @@ prompt_install_values() {
     echo -e "  Upstream:    ${COLOR_GREEN}${INSTALL_UPSTREAM}${COLOR_RESET}"
     echo -e "  HTTP port:   ${COLOR_GREEN}${NGINX_HTTP_PORT}${COLOR_RESET}"
     echo -e "  HTTPS port:  ${COLOR_GREEN}${NGINX_HTTPS_PORT}${COLOR_RESET}"
-    echo -e "  Token:       ${COLOR_GREEN}${INSTALL_TOKEN}${COLOR_RESET}"
+    echo -e "  Token:       ${COLOR_GREEN}${INSTALL_TOKEN:-<not set>}${COLOR_RESET}"
     echo -e "  Allowed IPs: ${COLOR_GREEN}${INSTALL_ALLOWED:-<all>}${COLOR_RESET}"
     echo -e "  Cache TTL:   ${COLOR_GREEN}${INSTALL_CACHE_TTL}s${COLOR_RESET}"
     echo
 }
 
 # ── .env writer ────────────────────────────────────────────────────────────────
+# FIX #15: back up existing .env before overwriting so a crash mid-write does
+# not leave a corrupt file.
 write_env_file() {
     local timezone=""
     command -v timedatectl >/dev/null 2>&1 && \
         timezone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
-    [[ -z "${timezone}" && -f /etc/timezone ]] && timezone=$(cat /etc/timezone 2>/dev/null || true)
+    [[ -z "${timezone}" && -f /etc/timezone ]] && \
+        timezone=$(cat /etc/timezone 2>/dev/null || true)
 
     local php_binary=""
     command -v php >/dev/null 2>&1 && php_binary=$(command -v php)
 
     mkdir -p "${ENV_DIR}"
+
+    if [[ -f "${ENV_PATH}" ]]; then
+        cp "${ENV_PATH}" "${ENV_PATH}.bak"
+        log_info "Existing .env backed up to ${ENV_PATH}.bak"
+    fi
+
     if [[ -f "${APP_DIR}/.env.example" ]]; then
         cp "${APP_DIR}/.env.example" "${ENV_PATH}"
     else
@@ -454,21 +510,19 @@ write_env_file() {
     set_env_value "RELAY_ADMIN_EMAIL"          "${INSTALL_EMAIL}"
     set_env_value "RELAY_NGINX_HTTP_PORT"      "${NGINX_HTTP_PORT}"
     set_env_value "RELAY_NGINX_HTTPS_PORT"     "${NGINX_HTTPS_PORT}"
-    [[ -n "${timezone}"    ]] && set_env_value "RELAY_TIMEZONE"    "${timezone}"
-    [[ -n "${php_binary}"  ]] && set_env_value "RELAY_PHP_BINARY"  "${php_binary}"
+    [[ -n "${timezone}"   ]] && set_env_value "RELAY_TIMEZONE"   "${timezone}"
+    [[ -n "${php_binary}" ]] && set_env_value "RELAY_PHP_BINARY" "${php_binary}"
 
     ensure_env_defaults
     ensure_env_permissions
 }
 
 # ── Nginx config writers ───────────────────────────────────────────────────────
-# FIX: detect real php-fpm socket before writing config.
 _nginx_fpm_sock() {
     detect_php_units
     if [[ -n "${PHP_FPM_SOCK}" ]]; then
         echo "${PHP_FPM_SOCK}"
     else
-        # Best-effort fallback; the admin will need to fix this if wrong.
         echo "/run/php/php-fpm.sock"
         log_warning "Could not resolve php-fpm socket path; defaulting to /run/php/php-fpm.sock."
         log_warning "Edit ${NGINX_SITE} if nginx fails to connect to PHP."
@@ -479,7 +533,7 @@ write_nginx_config() {
     local sock; sock="$(_nginx_fpm_sock)"
     mkdir -p "$(dirname "${NGINX_SITE}")" "$(dirname "${NGINX_LINK}")"
     cat > "${NGINX_SITE}" <<EOF
-# Hiddify Relay – HTTP only (SSL handled externally or by certbot upgrade)
+# Hiddify Relay - HTTP only (SSL handled externally or by certbot upgrade)
 server {
     listen ${NGINX_HTTP_PORT};
     server_name ${INSTALL_DOMAIN};
@@ -487,7 +541,6 @@ server {
     root ${APP_DIR}/public;
     index index.php;
 
-    # Block access to hidden files
     location ~ /\\.  { deny all; }
 
     location / {
@@ -511,7 +564,7 @@ write_nginx_ssl_config() {
     local sock; sock="$(_nginx_fpm_sock)"
     mkdir -p "$(dirname "${NGINX_SITE}")" "$(dirname "${NGINX_LINK}")"
     cat > "${NGINX_SITE}" <<EOF
-# Hiddify Relay – HTTPS with redirect
+# Hiddify Relay - HTTPS with redirect
 server {
     listen ${NGINX_HTTP_PORT};
     server_name ${INSTALL_DOMAIN};
@@ -531,7 +584,6 @@ server {
     root ${APP_DIR}/public;
     index index.php;
 
-    # Block access to hidden files
     location ~ /\\.  { deny all; }
 
     location / {
@@ -549,62 +601,59 @@ EOF
     ln -sf "${NGINX_SITE}" "${NGINX_LINK}"
 }
 
-# ── Certbot – HAProxy-aware ────────────────────────────────────────────────────
-# Strategy selection:
-#   1. If nginx owns port 80 → use certbot --nginx (rewrites config automatically).
-#   2. If port 80 is free but nginx is NOT on 80 → certbot standalone on ACME_HTTP_PORT.
-#   3. Neither works → prompt for manual cert paths or DNS-01 instructions.
-#
-# FIX: certbot --nginx REQUIRES nginx to be the process on port 80.  With HAProxy
-# on 80 this fails.  We detect the situation and fall back to standalone or DNS-01.
-run_certbot() {
-    [[ "${SKIP_CERTBOT:-0}" == "1" ]] && { log_info "SKIP_CERTBOT=1 – skipping."; return; }
-    [[ -z "${INSTALL_DOMAIN:-}" || -z "${INSTALL_EMAIL:-}" ]] && {
-        log_warning "Domain or email missing – skipping certbot."; return; }
-
-    local nginx_owns_80=0
-    local port_80_free=0
-
-    # Check who owns port 80
-    if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-        # Something is listening on 80; check if it's nginx
-        if ss -tlnp 2>/dev/null | grep ':80 ' | grep -q 'nginx'; then
-            nginx_owns_80=1
-        fi
+# ── Certbot - HAProxy-aware ────────────────────────────────────────────────────
+# FIX #3: use awk with an anchored port match instead of fragile grep patterns.
+# FIX #4: non-nginx process on port 80 goes straight to the failure handler
+#         instead of printing a warning and then calling it anyway.
+# FIX #5: removed spurious 2>&1 on certbot calls (output already on tty).
+_port_owner() {
+    local port="$1"
+    local listeners
+    listeners=$(ss -tlnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$"')
+    if [[ -z "${listeners}" ]]; then
+        echo "free"
+    elif echo "${listeners}" | grep -q 'nginx'; then
+        echo "nginx"
     else
-        port_80_free=1
+        echo "other"
     fi
+}
 
+run_certbot() {
+    [[ "${SKIP_CERTBOT:-0}" == "1" ]] && { log_info "SKIP_CERTBOT=1 - skipping."; return; }
+    [[ -z "${INSTALL_DOMAIN:-}" || -z "${INSTALL_EMAIL:-}" ]] && {
+        log_warning "Domain or email missing - skipping certbot."; return; }
+
+    local owner; owner="$(_port_owner 80)"
     local cert_issued=0
 
-    if [[ ${nginx_owns_80} -eq 1 ]]; then
-        log_info "Nginx owns port 80 – using certbot --nginx plugin."
+    if [[ "${owner}" == "nginx" ]]; then
+        log_info "Nginx owns port 80 - using certbot --nginx plugin."
         if certbot --nginx \
                 -d "${INSTALL_DOMAIN}" \
                 -m "${INSTALL_EMAIL}" \
-                --agree-tos --non-interactive --redirect 2>&1; then
+                --agree-tos --non-interactive --redirect; then
             log_success "Certificate issued via --nginx plugin."
             cert_issued=1
         fi
-    elif [[ ${port_80_free} -eq 1 ]] || [[ "${ACME_HTTP_PORT}" != "80" ]]; then
-        log_info "Using certbot standalone on port ${ACME_HTTP_PORT} (nginx will be stopped temporarily)."
-        # Temporarily stop nginx so standalone can bind
+    elif [[ "${owner}" == "free" ]]; then
+        log_info "Port 80 is free - using certbot standalone on port ${ACME_HTTP_PORT}."
         systemctl stop nginx 2>/dev/null || true
         if certbot certonly --standalone \
                 --http-01-port "${ACME_HTTP_PORT}" \
                 -d "${INSTALL_DOMAIN}" \
                 -m "${INSTALL_EMAIL}" \
-                --agree-tos --non-interactive 2>&1; then
+                --agree-tos --non-interactive; then
             log_success "Certificate issued via standalone."
             cert_issued=1
-            # Write SSL config pointing to the newly obtained cert
             local live_dir="/etc/letsencrypt/live/${INSTALL_DOMAIN}"
             write_nginx_ssl_config "${live_dir}/fullchain.pem" "${live_dir}/privkey.pem"
         fi
         systemctl start nginx 2>/dev/null || true
     else
-        log_warning "Port 80 is occupied by a non-nginx process (HAProxy?)."
-        log_warning "Certbot HTTP-01 challenge will likely fail."
+        # Port 80 is owned by something other than nginx (e.g. HAProxy).
+        # Skip straight to the interactive failure/fallback handler.
+        log_warning "Port 80 is occupied by a non-nginx process."
     fi
 
     if [[ ${cert_issued} -eq 0 ]]; then
@@ -631,15 +680,15 @@ _handle_certbot_failure() {
                 read -rp "Private key path: " key_path
                 [[ -z "${cert_path}" || -z "${key_path}" ]] && \
                     { log_error "Both paths required."; continue; }
-                # FIX: sanitize paths – strip leading/trailing whitespace
-                cert_path="${cert_path// /}"
-                key_path="${key_path// /}"
+                # FIX #13: trim leading/trailing whitespace only, not internal spaces.
+                cert_path="$(echo "${cert_path}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                key_path="$(echo "${key_path}"   | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
                 if [[ ! -r "${cert_path}" || ! -r "${key_path}" ]]; then
                     log_error "Cannot read certificate or key. Check paths and permissions."
                     continue
                 fi
                 write_nginx_ssl_config "${cert_path}" "${key_path}"
-                if nginx -t 2>&1; then
+                if nginx -t; then
                     systemctl reload nginx
                     log_success "Nginx updated with provided certificate."
                     return
@@ -649,15 +698,17 @@ _handle_certbot_failure() {
             D)
                 echo
                 echo -e "${COLOR_BOLD}DNS-01 Challenge Instructions:${COLOR_RESET}"
-                echo "  1. Install a DNS plugin: apt-get install -y certbot python3-certbot-dns-cloudflare"
+                echo "  1. Install a DNS plugin:"
+                echo "       apt-get install -y certbot python3-certbot-dns-cloudflare"
                 echo "     (or whichever matches your DNS provider)"
                 echo "  2. Configure credentials per your provider's docs."
-                echo "  3. Run: certbot certonly --dns-cloudflare \\"
-                echo "       --dns-cloudflare-credentials /etc/cloudflare.ini \\"
-                echo "       -d ${INSTALL_DOMAIN:-your.domain} \\"
-                echo "       -m ${INSTALL_EMAIL:-admin@example.com} --agree-tos"
-                echo "  4. Then re-run: sudo ${SCRIPT_NAME} install"
-                echo "     and choose [P] to provide the resulting cert paths."
+                echo "  3. Run:"
+                echo "       certbot certonly --dns-cloudflare \\"
+                echo "         --dns-cloudflare-credentials /etc/cloudflare.ini \\"
+                echo "         -d ${INSTALL_DOMAIN:-your.domain} \\"
+                echo "         -m ${INSTALL_EMAIL:-admin@example.com} --agree-tos"
+                echo "  4. Then re-run:  sudo ${SCRIPT_NAME} install"
+                echo "     and choose [P] to supply the resulting cert paths."
                 echo
                 ;;
             R)
@@ -666,14 +717,12 @@ _handle_certbot_failure() {
                         --http-01-port "${ACME_HTTP_PORT:-80}" \
                         -d "${INSTALL_DOMAIN}" \
                         -m "${INSTALL_EMAIL}" \
-                        --agree-tos --non-interactive 2>&1; then
+                        --agree-tos --non-interactive; then
                     log_success "Certificate issued."
                     local live_dir="/etc/letsencrypt/live/${INSTALL_DOMAIN}"
                     write_nginx_ssl_config "${live_dir}/fullchain.pem" "${live_dir}/privkey.pem"
                     systemctl start nginx 2>/dev/null || true
-                    if nginx -t 2>&1; then
-                        systemctl reload nginx
-                    fi
+                    nginx -t && systemctl reload nginx
                     return
                 fi
                 systemctl start nginx 2>/dev/null || true
@@ -687,6 +736,8 @@ _handle_certbot_failure() {
 }
 
 # ── install / update ───────────────────────────────────────────────────────────
+# FIX #10: use 'return 1' instead of 'exit 1' for validation errors so the
+# interactive menu is not killed when install fails inside main_menu.
 install_relay() {
     local reuse_config=0
 
@@ -704,10 +755,9 @@ install_relay() {
         ensure_storage_permissions
         ensure_env_defaults
         ensure_env_permissions
-        # FIX: test nginx config and abort rather than reload with a broken config
         if ! nginx -t; then
             log_error "Nginx config test failed. Check ${NGINX_SITE} (php-fpm socket?)."
-            log_error "Run: sudo ${SCRIPT_NAME} config  — to edit settings, then: sudo ${SCRIPT_NAME} reload"
+            log_error "Run: sudo ${SCRIPT_NAME} config  then: sudo ${SCRIPT_NAME} reload"
             maybe_pause; return 1
         fi
         systemctl reload nginx
@@ -723,11 +773,15 @@ install_relay() {
 
     prompt_install_values
 
-    [[ -z "${INSTALL_DOMAIN:-}" ]]   && { log_error "Domain is required."; exit 1; }
-    [[ -z "${INSTALL_UPSTREAM:-}" ]] && { log_error "Upstream URL is required."; exit 1; }
+    if [[ -z "${INSTALL_DOMAIN:-}" ]]; then
+        log_error "Domain is required."; maybe_pause; return 1
+    fi
+    if [[ -z "${INSTALL_UPSTREAM:-}" ]]; then
+        log_error "Upstream URL is required."; maybe_pause; return 1
+    fi
     if [[ -z "${INSTALL_EMAIL:-}" && "${SKIP_CERTBOT:-0}" != "1" ]]; then
         log_error "Email required for Let's Encrypt. Set SKIP_CERTBOT=1 to skip."
-        exit 1
+        maybe_pause; return 1
     fi
 
     ensure_packages
@@ -738,12 +792,11 @@ install_relay() {
 
     if ! nginx -t; then
         log_error "Nginx config test failed. Aborting to prevent breaking the web server."
-        exit 1
+        maybe_pause; return 1
     fi
     systemctl reload nginx
     log_success "Nginx reloaded with HTTP config."
     run_certbot
-    # After certbot (which may have rewritten the config), re-test and reload
     if nginx -t; then
         systemctl reload nginx
         log_success "Nginx reloaded after SSL setup."
@@ -753,11 +806,11 @@ install_relay() {
     reload_php_units
 
     log_success "Installation complete."
-    echo -e "  Domain:          ${COLOR_GREEN}${INSTALL_DOMAIN}${COLOR_RESET}"
-    echo -e "  Shared token:    ${COLOR_GREEN}${INSTALL_TOKEN}${COLOR_RESET}"
-    echo -e "  Environment:     ${COLOR_GREEN}${ENV_PATH}${COLOR_RESET}"
-    echo -e "  Install dir:     ${COLOR_GREEN}${INSTALL_DIR}${COLOR_RESET}"
-    echo -e "  App dir:         ${COLOR_GREEN}${APP_DIR}${COLOR_RESET}"
+    echo -e "  Domain:       ${COLOR_GREEN}${INSTALL_DOMAIN}${COLOR_RESET}"
+    echo -e "  Shared token: ${COLOR_GREEN}${INSTALL_TOKEN:-<not set>}${COLOR_RESET}"
+    echo -e "  Environment:  ${COLOR_GREEN}${ENV_PATH}${COLOR_RESET}"
+    echo -e "  Install dir:  ${COLOR_GREEN}${INSTALL_DIR}${COLOR_RESET}"
+    echo -e "  App dir:      ${COLOR_GREEN}${APP_DIR}${COLOR_RESET}"
     [[ "${NGINX_HTTP_PORT}" != "80" ]] && \
         log_warning "Remember to configure HAProxy to forward to port ${NGINX_HTTP_PORT}/${NGINX_HTTPS_PORT}."
 }
@@ -846,6 +899,14 @@ show_status() {
     maybe_pause
 }
 
+# FIX #11: JSON-escape string values before embedding them in the JSON output.
+_json_escape() {
+    printf '%s' "$1" | python3 -c "
+import sys, json
+sys.stdout.write(json.dumps(sys.stdin.read())[1:-1])
+"
+}
+
 show_status_json() {
     local installation_present="false" config_present="false"
     local nginx_enabled="false" nginx_active="false"
@@ -863,7 +924,6 @@ show_status_json() {
 
     if [[ -d "${CACHE_DIR}" ]]; then
         cache_entries=$(find "${CACHE_DIR}" -type f 2>/dev/null | wc -l)
-        # FIX: guard against empty output from du
         cache_size=$(du -sb "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')
         [[ -z "${cache_size}" ]] && cache_size=0
     fi
@@ -878,16 +938,23 @@ show_status_json() {
     [[ ${#PHP_FPM_UNITS[@]} -gt 0 ]] && \
         systemctl is-active "${PHP_FPM_UNITS[0]}" >/dev/null 2>&1 && php_status="active"
 
+    local j_upstream j_log_path j_install_path j_env_path j_sock
+    j_upstream="$(_json_escape "${upstream}")"
+    j_log_path="$(_json_escape "${LOG_FILE}")"
+    j_install_path="$(_json_escape "${INSTALL_DIR}")"
+    j_env_path="$(_json_escape "${ENV_PATH}")"
+    j_sock="$(_json_escape "${PHP_FPM_SOCK:-}")"
+
     cat <<EOF
 {
-  "installation": { "present": ${installation_present}, "path": "${INSTALL_DIR}" },
-  "configuration": { "present": ${config_present}, "path": "${ENV_PATH}", "upstream": "${upstream}" },
+  "installation": { "present": ${installation_present}, "path": "${j_install_path}" },
+  "configuration": { "present": ${config_present}, "path": "${j_env_path}", "upstream": "${j_upstream}" },
   "services": {
     "nginx": { "enabled": ${nginx_enabled}, "active": ${nginx_active} },
-    "php_fpm": { "active": "${php_status}", "socket": "${PHP_FPM_SOCK:-}" }
+    "php_fpm": { "active": "${php_status}", "socket": "${j_sock}" }
   },
   "cache": { "entries": ${cache_entries}, "size_bytes": ${cache_size} },
-  "logs": { "lines": ${log_lines}, "errors": ${log_errors}, "path": "${LOG_FILE}" }
+  "logs": { "lines": ${log_lines}, "errors": ${log_errors}, "path": "${j_log_path}" }
 }
 EOF
 }
@@ -906,7 +973,6 @@ monitoring_dashboard() {
     local cache_dir="${RELAY_CACHE_DIR:-${APP_DIR}/storage/cache}"
     local log_file="${RELAY_LOG_FILE:-${APP_DIR}/storage/relay.log}"
 
-    # Cache
     local cache_entries=0 cache_size_bytes=0
     if [[ -d "${cache_dir}" ]]; then
         cache_entries=$(find "${cache_dir}" -type f 2>/dev/null | wc -l | tr -d ' ')
@@ -914,7 +980,6 @@ monitoring_dashboard() {
         [[ -z "${cache_size_bytes}" ]] && cache_size_bytes=0
     fi
 
-    # Logs
     local log_lines=0 log_errors=0 recent_errors=""
     if [[ -f "${log_file}" ]]; then
         log_lines=$(wc -l < "${log_file}" 2>/dev/null || echo 0)
@@ -922,8 +987,6 @@ monitoring_dashboard() {
         recent_errors=$(grep -i "error" "${log_file}" 2>/dev/null | tail -n 5)
     fi
 
-    # Upstream health check
-    # FIX: guard against empty curl output before arithmetic comparison
     local upstream_status="not configured" upstream_http="-" upstream_time="-"
     if [[ -n "${upstream}" ]]; then
         local curl_output
@@ -932,7 +995,6 @@ monitoring_dashboard() {
         if [[ -n "${curl_output}" && "${curl_output}" != " " ]]; then
             upstream_http="${curl_output%% *}"
             upstream_time="${curl_output##* }"
-            # Only do numeric comparison when we have an actual HTTP code
             if [[ "${upstream_http}" =~ ^[0-9]+$ ]]; then
                 if (( upstream_http >= 200 && upstream_http < 500 )); then
                     upstream_status="reachable"
@@ -952,7 +1014,7 @@ monitoring_dashboard() {
     if [[ -n "${upstream}" ]]; then
         echo -e "  URL: ${COLOR_CYAN}${upstream}${COLOR_RESET}"
         local status_color="${COLOR_YELLOW}"
-        [[ "${upstream_status}" == "reachable" ]] && status_color="${COLOR_GREEN}"
+        [[ "${upstream_status}" == "reachable" ]]  && status_color="${COLOR_GREEN}"
         [[ "${upstream_status}" == unreachable* ]] && status_color="${COLOR_RED}"
         echo -e "  Status:        ${status_color}${upstream_status^^}${COLOR_RESET}"
         echo -e "  HTTP code:     ${COLOR_CYAN}${upstream_http}${COLOR_RESET}"
@@ -993,7 +1055,7 @@ monitoring_dashboard() {
         disk_line=$(df -h "${APP_DIR}" 2>/dev/null | awk 'NR==2 {print $2" total, "$3" used ("$5")"}')
         [[ -n "${disk_line}" ]] && echo -e "  Disk (install path): ${COLOR_CYAN}${disk_line}${COLOR_RESET}"
     fi
-    echo -e "  PHP version: ${COLOR_CYAN}$(php -r 'echo PHP_VERSION;' 2>/dev/null || echo 'unknown')${COLOR_RESET}"
+    echo -e "  PHP version:  ${COLOR_CYAN}$(php -r 'echo PHP_VERSION;' 2>/dev/null || echo 'unknown')${COLOR_RESET}"
     detect_php_units
     echo -e "  PHP-FPM sock: ${COLOR_CYAN}${PHP_FPM_SOCK:-<not detected>}${COLOR_RESET}"
 
@@ -1028,15 +1090,16 @@ edit_configuration() {
     maybe_pause
 }
 
+# FIX #9: removed maybe_pause from reload_services so that update_from_git
+# (which calls reload_services then its own maybe_pause) doesn't pause twice.
 reload_services() {
     if nginx -t; then
         systemctl reload nginx
         log_success "nginx reloaded."
     else
-        log_error "nginx config test failed – not reloading. Fix errors above first."
+        log_error "nginx config test failed - not reloading. Fix errors above first."
     fi
     reload_php_units
-    maybe_pause
 }
 
 enable_nginx_site() {
@@ -1069,7 +1132,6 @@ disable_nginx_site() {
     maybe_pause
 }
 
-# FIX: update now mirrors clone_or_update_repo (fetch + reset --hard)
 update_from_git() {
     ensure_paths || { maybe_pause; return; }
     if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
@@ -1103,22 +1165,18 @@ tail_logs() {
     fi
     log_header "Relay Logs (Ctrl+C to exit)"
     echo -e "${COLOR_CYAN}Following: ${LOG_FILE}${COLOR_RESET}\n"
-    # FIX: if stdin/stdout were re-opened to /dev/tty at startup, tail -f works fine.
     tail -f "${LOG_FILE}" || { log_error "Failed to tail log file"; maybe_pause; }
 }
 
 # ── Removal ────────────────────────────────────────────────────────────────────
 _remove_common() {
+    _assert_safe_install_dir
     [[ -L "${NGINX_LINK}" ]] && rm -f "${NGINX_LINK}"
     [[ -f "${NGINX_SITE}" ]] && rm -f "${NGINX_SITE}"
     [[ -d "${INSTALL_DIR}" ]] && rm -rf "${INSTALL_DIR}"
-    # FIX: also remove the env directory (was left behind in original)
-    [[ -d "${ENV_DIR}" ]] && rm -rf "${ENV_DIR}"
-    # NOTE: STATE_DIR is intentionally NOT removed here.
-    # purge_installation reads INSTALLED_PKGS_FILE from STATE_DIR after calling
-    # this function, so it cleans STATE_DIR up itself at the end.
-    # remove_installation (non-purge) also removes STATE_DIR explicitly below.
-    # Reload nginx only if it's still running and config is valid
+    [[ -d "${ENV_DIR}" ]]     && rm -rf "${ENV_DIR}"
+    # NOTE: STATE_DIR intentionally not removed here — purge_installation reads
+    # INSTALLED_PKGS_FILE from it after calling this function.
     if systemctl is-active nginx >/dev/null 2>&1; then
         nginx -t 2>/dev/null && systemctl reload nginx || true
     fi
@@ -1137,11 +1195,9 @@ purge_installation() {
     read -rp "Remove installation AND purge packages installed by this script? (y/N): " answer
     [[ "${answer}" =~ ^[Yy]$ ]] || { log_info "Aborted."; maybe_pause; return; }
 
-    # Read the package list BEFORE _remove_common, which cleans STATE_DIR.
+    # Read package list BEFORE _remove_common wipes STATE_DIR.
     local purge_pkgs=()
-    if [[ -f "${INSTALLED_PKGS_FILE}" ]]; then
-        mapfile -t purge_pkgs < "${INSTALLED_PKGS_FILE}"
-    fi
+    [[ -f "${INSTALLED_PKGS_FILE}" ]] && mapfile -t purge_pkgs < "${INSTALLED_PKGS_FILE}"
 
     _remove_common
 
@@ -1150,16 +1206,12 @@ purge_installation() {
         DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "${purge_pkgs[@]}"
         DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
     else
-        log_info "No package list found in ${STATE_DIR}."
-        log_info "This is normal if you ran 'install' before package tracking was added,"
-        log_info "or if packages were already present before this script ran."
-        log_info "To remove packages manually, run:"
+        log_info "No package list found - nothing extra to purge."
+        log_info "To remove packages manually:"
         log_info "  apt-get remove --purge git nginx php-cli php-curl certbot python3-certbot-nginx unzip rsync openssl php*-fpm"
     fi
 
-    # Clean STATE_DIR last (after we've read from it)
     [[ -d "${STATE_DIR}" ]] && rm -rf "${STATE_DIR}"
-
     log_success "Relay installation removed."
     maybe_pause
 }
@@ -1227,7 +1279,7 @@ main_menu() {
             2)  show_status ;;
             3)  monitoring_dashboard ;;
             4)  edit_configuration ;;
-            5)  reload_services ;;
+            5)  reload_services; maybe_pause ;;
             6)  enable_nginx_site ;;
             7)  disable_nginx_site ;;
             8)  clear_cache ;;
@@ -1247,19 +1299,19 @@ main() {
     local cmd="${1:-menu}"
     shift || true
     case "${cmd}" in
-        install)      install_relay ;;
-        status)       show_status "$@" ;;
-        monitor)      monitoring_dashboard ;;
-        config|env)   edit_configuration ;;
-        reload)       reload_services ;;
-        enable-site)  enable_nginx_site ;;
-        disable-site) disable_nginx_site ;;
-        clear-cache)  clear_cache ;;
-        tail-logs)    tail_logs ;;
-        update)       update_from_git ;;
-        remove)       remove_installation ;;
-        purge)        purge_installation ;;
-        menu)         main_menu ;;
+        install)        install_relay ;;
+        status)         show_status "$@" ;;
+        monitor)        monitoring_dashboard ;;
+        config|env)     edit_configuration ;;
+        reload)         reload_services; maybe_pause ;;
+        enable-site)    enable_nginx_site ;;
+        disable-site)   disable_nginx_site ;;
+        clear-cache)    clear_cache ;;
+        tail-logs)      tail_logs ;;
+        update)         update_from_git ;;
+        remove)         remove_installation ;;
+        purge)          purge_installation ;;
+        menu)           main_menu ;;
         help|-h|--help) show_usage ;;
         *)  log_error "Unknown command: ${cmd}"; show_usage; exit 1 ;;
     esac
