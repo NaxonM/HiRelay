@@ -19,6 +19,10 @@ relay.zip
 # already ignore .env files above; also ignore any env backups
 **/.env.*
 
+# Allow tracking of example env templates
+!**/.env.example
+!apps/relay/.env.example
+
 # Tools and data artifacts
 tools/data/updated_backup.json
 tools/data/cache.zip
