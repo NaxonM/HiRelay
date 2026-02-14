@@ -18,3 +18,12 @@ relay.zip
 
 # already ignore .env files above; also ignore any env backups
 **/.env.*
+
+# Tools and data artifacts
+tools/data/updated_backup.json
+tools/data/cache.zip
+tools/linux-deploy/config.env
+
+# backup and exported archives
+tools/data/*.json
+tools/data/*.zip
